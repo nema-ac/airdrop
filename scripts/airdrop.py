@@ -26,6 +26,17 @@ from spl.token.client import Token
 from spl.token.constants import TOKEN_PROGRAM_ID
 from spl.token.instructions import get_associated_token_address, create_associated_token_account, transfer_checked, TransferCheckedParams
 
+# Hardcoded blacklist of wallet addresses to skip during airdrop
+BLACKLIST_WALLETS = {
+    # Add wallet addresses here that should be skipped
+   "9BfqKraENX95B3HaiKVK6r4ui1dNisybwEWsvNbpFMQf", # sold all after phase 1
+   "FXJPkytQmpHHnMWhSsXPi4xY33ZpAFeEBHo1xMq6RdLW", # sold all after phase 1
+   "2Na47Z9sx8ZeMonJamiJQE56JJiyWJtEhmfkU8axVUUt", # sold all after phase 1
+   "GfRShkKnMRaCaUqX9vzgNhvZmBbqAsfsHQivhrQ4kqMm",
+   "7S4xWfY3ze9FRC4fQ4U5x3y8BHk8rRoNDqStVca6tR9h"
+ # sold all after phase 1
+}
+
 
 @dataclass
 class AirdropConfig:
@@ -34,7 +45,7 @@ class AirdropConfig:
     source_keypair: Keypair
     token_mint: Pubkey
     csv_file_path: str
-    phase: int
+    phases: List[int]
     dry_run: bool = False
     batch_size: int = 10
     delay_between_batches: float = 1.0
@@ -44,6 +55,7 @@ class AirdropConfig:
     log_level: str = "INFO"
     progress_file: str = "airdrop_progress.json"
     token_decimals: int = 6
+    limit: Optional[int] = None
 
 
 @dataclass
@@ -66,6 +78,7 @@ class SolanaAirdropManager:
         self.successful_transfers = 0
         self.failed_transfers = 0
         self.skipped_transfers = 0
+        self.blacklisted_wallets = 0
 
         # Setup logging with phase info
         self._setup_logging()
@@ -83,11 +96,15 @@ class SolanaAirdropManager:
 
         self.logger.info("Initialized SolanaAirdropManager")
         self.logger.info(f"Mode: {'DRY RUN' if config.dry_run else 'LIVE'}")
-        self.logger.info(f"Phase: {config.phase}")
+        phases_str = ",".join(map(str, config.phases))
+        self.logger.info(f"Phases: {phases_str}")
         self.logger.info(f"RPC URL: {config.rpc_url}")
         self.logger.info(f"Source Wallet: {config.source_keypair.pubkey()}")
         self.logger.info(f"Token Mint: {config.token_mint}")
         self.logger.info(f"CSV File: {config.csv_file_path}")
+        self.logger.info(f"Blacklist: {len(BLACKLIST_WALLETS)} wallets configured")
+        if config.limit:
+            self.logger.info(f"Limit: Processing only first {config.limit} recipients")
 
     def _setup_logging(self):
         """Setup logging configuration."""
@@ -96,7 +113,8 @@ class SolanaAirdropManager:
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         logs_dir = os.path.join(base_dir, 'logs')
         os.makedirs(logs_dir, exist_ok=True)
-        log_filename = os.path.join(logs_dir, f'airdrop_phase{self.config.phase}_{timestamp}.log')
+        phases_str = "_".join(map(str, self.config.phases))
+        log_filename = os.path.join(logs_dir, f'airdrop_phases{phases_str}_{timestamp}.log')
         logging.basicConfig(
             level=getattr(logging, self.config.log_level.upper()),
             format=log_format,
@@ -132,7 +150,15 @@ class SolanaAirdropManager:
                         self.logger.error(f"Error parsing row {row_num}: {e}")
                         continue
 
+            # Apply limit if specified
+            if self.config.limit and len(self.recipients) > self.config.limit:
+                original_count = len(self.recipients)
+                self.recipients = self.recipients[:self.config.limit]
+                self.logger.info(f"Applied limit: Using first {len(self.recipients)} of {original_count} recipients")
+            
             self.logger.info(f"Loaded {len(self.recipients)} recipients")
+            if self.blacklisted_wallets > 0:
+                self.logger.info(f"Skipped {self.blacklisted_wallets} blacklisted wallets")
             return len(self.recipients) > 0
 
         except Exception as e:
@@ -145,13 +171,29 @@ class SolanaAirdropManager:
             sol_wallet = row['sol_wallet'].strip()
             worm_balance = int(row['worm_balance'])
 
-            # Get the correct phase column based on configuration
-            phase_column = f'phase{self.config.phase}_tokens'
-            if phase_column not in row:
-                self.logger.error(f"Phase column '{phase_column}' not found in CSV at row {row_num}")
+            # Check if wallet is blacklisted
+            if sol_wallet in BLACKLIST_WALLETS:
+                self.logger.info(f"Skipping blacklisted wallet at row {row_num}: {sol_wallet}")
+                self.blacklisted_wallets += 1
                 return None
 
-            sol_nema_tokens = float(row[phase_column])
+            # Sum tokens from all specified phases
+            sol_nema_tokens = 0.0
+            missing_columns = []
+
+            for phase in self.config.phases:
+                phase_column = f'phase{phase}_tokens'
+                if phase_column not in row:
+                    missing_columns.append(phase_column)
+                    continue
+
+                phase_tokens = float(row[phase_column])
+                sol_nema_tokens += phase_tokens
+
+            # Check if any required columns were missing
+            if missing_columns:
+                self.logger.error(f"Phase columns {missing_columns} not found in CSV at row {row_num}")
+                return None
 
             # Validate wallet address
             try:
@@ -189,7 +231,7 @@ class SolanaAirdropManager:
             self.logger.info(f"Source wallet SOL balance: {sol_balance_sol:.4f} SOL")
 
             # Estimate minimum SOL needed (rough estimate: 0.01 SOL per transaction)
-            estimated_sol_needed = len(self.recipients) * 0.01
+            estimated_sol_needed = len(self.recipients) * 0.001
             if sol_balance_sol < estimated_sol_needed:
                 self.logger.error(f"Insufficient SOL for transaction fees. Need ~{estimated_sol_needed:.2f} SOL, have {sol_balance_sol:.4f} SOL")
                 return False
@@ -218,16 +260,17 @@ class SolanaAirdropManager:
                 self.logger.error(f"Insufficient tokens in source wallet. Need {total_tokens:,.2f}, have {source_token_balance:,.0f}")
                 return False
 
-            # Validate total matches expected amount for this phase
+            # Validate total matches expected amount for the specified phases
             phase_expected = {
                 1: 50_000_000,   # 5% of 1B
                 2: 100_000_000,  # 10% of 1B
                 3: 100_000_000,  # 10% of 1B
                 4: 50_000_000    # 5% of 1B
             }
-            expected_total = phase_expected.get(self.config.phase, 50_000_000)
+            expected_total = sum(phase_expected.get(phase, 0) for phase in self.config.phases)
             if abs(total_tokens - expected_total) > 1000:  # Allow small variance
-                self.logger.warning(f"Phase {self.config.phase} tokens ({total_tokens:,.2f}) differs significantly from expected ({expected_total:,.2f})")
+                phases_str = ",".join(map(str, self.config.phases))
+                self.logger.warning(f"Phases {phases_str} tokens ({total_tokens:,.2f}) differs significantly from expected ({expected_total:,.2f})")
 
             return True
 
@@ -299,8 +342,7 @@ class SolanaAirdropManager:
 
             try:
                 # Build transaction with multiple account creations
-                transaction = Transaction()
-                recent_blockhash = self.rpc_client.get_latest_blockhash().value.blockhash
+                instructions = []
 
                 for recipient in batch:
                     # Skip if pubkey is None (should not happen at this point, but safety check)
@@ -313,15 +355,21 @@ class SolanaAirdropManager:
                         owner=recipient.pubkey,
                         mint=self.config.token_mint
                     )
-                    transaction.add(create_account_ix)
+                    instructions.append(create_account_ix)
 
-                transaction.recent_blockhash = recent_blockhash
+                # Get fresh blockhash right before sending
+                recent_blockhash = self.rpc_client.get_latest_blockhash().value.blockhash
+                transaction = Transaction.new_signed_with_payer(
+                    instructions,
+                    self.config.source_keypair.pubkey(),
+                    [self.config.source_keypair],
+                    recent_blockhash
+                )
 
                 # Send transaction
                 result = self.rpc_client.send_transaction(
                     transaction,
-                    self.config.source_keypair,
-                    TxOpts(skip_confirmation=False, skip_preflight=False)
+                    opts=TxOpts(skip_confirmation=False, skip_preflight=False)
                 )
 
                 if result.value:
@@ -358,14 +406,17 @@ class SolanaAirdropManager:
                 mint=self.config.token_mint
             )
 
-            transaction = Transaction()
+            # Get fresh blockhash right before sending
             recent_blockhash = self.rpc_client.get_latest_blockhash().value.blockhash
-            transaction.add(create_account_ix)
-            transaction.recent_blockhash = recent_blockhash
+            transaction = Transaction.new_signed_with_payer(
+                [create_account_ix],
+                self.config.source_keypair.pubkey(),
+                [self.config.source_keypair],
+                recent_blockhash
+            )
 
             result = self.rpc_client.send_transaction(
                 transaction,
-                self.config.source_keypair,
                 opts=TxOpts(skip_confirmation=False, skip_preflight=False)
             )
 
@@ -429,8 +480,7 @@ class SolanaAirdropManager:
     def _execute_transfer_batch(self, recipients: List[Recipient], source_token_account: Pubkey) -> bool:
         """Execute token transfers for a batch of recipients."""
         try:
-            transaction = Transaction()
-            recent_blockhash = self.rpc_client.get_latest_blockhash().value.blockhash
+            instructions = []
 
             for recipient in recipients:
                 # Skip recipients with missing pubkey or token account
@@ -452,14 +502,20 @@ class SolanaAirdropManager:
                         decimals=self.config.token_decimals,
                     )
                 )
-                transaction.add(transfer_ix)
+                instructions.append(transfer_ix)
 
-            transaction.recent_blockhash = recent_blockhash
+            # Get fresh blockhash right before sending
+            recent_blockhash = self.rpc_client.get_latest_blockhash().value.blockhash
+            transaction = Transaction.new_signed_with_payer(
+                instructions,
+                self.config.source_keypair.pubkey(),
+                [self.config.source_keypair],
+                recent_blockhash
+            )
 
             # Send transaction
             result = self.rpc_client.send_transaction(
                 transaction,
-                self.config.source_keypair,
                 opts=TxOpts(skip_confirmation=False, skip_preflight=False)
             )
 
@@ -501,15 +557,18 @@ class SolanaAirdropManager:
                     )
                 )
 
-                transaction = Transaction()
+                # Get fresh blockhash right before sending
                 recent_blockhash = self.rpc_client.get_latest_blockhash().value.blockhash
-                transaction.add(transfer_ix)
-                transaction.recent_blockhash = recent_blockhash
+                transaction = Transaction.new_signed_with_payer(
+                    [transfer_ix],
+                    self.config.source_keypair.pubkey(),
+                    [self.config.source_keypair],
+                    recent_blockhash
+                )
 
                 result = self.rpc_client.send_transaction(
                     transaction,
-                    self.config.source_keypair,
-                    TxOpts(skip_confirmation=False, skip_preflight=False)
+                    opts=TxOpts(skip_confirmation=False, skip_preflight=False)
                 )
 
                 if result.value:
@@ -563,11 +622,13 @@ class SolanaAirdropManager:
         try:
             progress_data = {
                 'timestamp': int(time.time()),
-                'phase': self.config.phase,
+                'phases': self.config.phases,
                 'total_recipients': len(self.recipients),
                 'successful_transfers': self.successful_transfers,
                 'failed_transfers': self.failed_transfers,
                 'skipped_transfers': self.skipped_transfers,
+                'blacklisted_wallets': self.blacklisted_wallets,
+                'limit_used': self.config.limit,
                 'recipients': [
                     {
                         'sol_wallet': r.sol_wallet,
@@ -596,9 +657,14 @@ class SolanaAirdropManager:
             with open(self.config.progress_file, 'r') as f:
                 progress_data = json.load(f)
 
-            # Check if progress file is for the same phase and recipients
-            if progress_data.get('phase') != self.config.phase:
-                self.logger.warning(f"Progress file is for phase {progress_data.get('phase')}, but current phase is {self.config.phase}")
+            # Check if progress file is for the same phases and recipients
+            saved_phases = progress_data.get('phases', progress_data.get('phase'))  # Handle old format
+            if isinstance(saved_phases, int):
+                saved_phases = [saved_phases]  # Convert old single phase format
+            if saved_phases != self.config.phases:
+                phases_str = ",".join(map(str, self.config.phases))
+                saved_phases_str = ",".join(map(str, saved_phases)) if saved_phases else "None"
+                self.logger.warning(f"Progress file is for phases {saved_phases_str}, but current phases are {phases_str}")
                 return False
 
             if progress_data.get('total_recipients') != len(self.recipients):
@@ -609,6 +675,7 @@ class SolanaAirdropManager:
             self.successful_transfers = progress_data.get('successful_transfers', 0)
             self.failed_transfers = progress_data.get('failed_transfers', 0)
             self.skipped_transfers = progress_data.get('skipped_transfers', 0)
+            self.blacklisted_wallets = progress_data.get('blacklisted_wallets', 0)
 
             # Restore recipient statuses
             progress_recipients = {r['sol_wallet']: r['status'] for r in progress_data.get('recipients', [])}
@@ -711,6 +778,7 @@ class SolanaAirdropManager:
         self.logger.info(f"Successful Transfers: {self.successful_transfers:,}")
         self.logger.info(f"Failed Transfers: {self.failed_transfers:,}")
         self.logger.info(f"Skipped Transfers: {self.skipped_transfers:,}")
+        self.logger.info(f"Blacklisted Wallets: {self.blacklisted_wallets:,}")
         self.logger.info("-" * 50)
         self.logger.info(f"Total Tokens Distributed: {successful_tokens:,.2f}")
         self.logger.info(f"Tokens Failed to Distribute: {failed_tokens:,.2f}")
@@ -741,7 +809,8 @@ class SolanaAirdropManager:
         # Create reports directory for this run
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         run_prefix = "run_dry" if self.config.dry_run else "run_live"
-        run_dir = os.path.join(base_dir, 'reports', f"{run_prefix}_phase{self.config.phase}_{timestamp}")
+        phases_str = "_".join(map(str, self.config.phases))
+        run_dir = os.path.join(base_dir, 'reports', f"{run_prefix}_phases{phases_str}_{timestamp}")
         os.makedirs(run_dir, exist_ok=True)
 
         # Generate report file paths
@@ -785,11 +854,13 @@ class SolanaAirdropManager:
                 writer = csv.writer(f)
                 writer.writerow(['metric', 'value'])
                 writer.writerow(['timestamp', timestamp])
-                writer.writerow(['phase', self.config.phase])
+                phases_str = ",".join(map(str, self.config.phases))
+                writer.writerow(['phases', phases_str])
                 writer.writerow(['total_recipients', len(self.recipients)])
                 writer.writerow(['successful_transfers', self.successful_transfers])
                 writer.writerow(['failed_transfers', self.failed_transfers])
                 writer.writerow(['skipped_transfers', self.skipped_transfers])
+                writer.writerow(['blacklisted_wallets', self.blacklisted_wallets])
 
                 successful_tokens = sum(r.sol_nema_tokens for r in self.recipients if r.status == "success")
                 failed_tokens = sum(r.sol_nema_tokens for r in self.recipients if r.status == "failed")
@@ -838,10 +909,13 @@ Optional Environment Variables:
 
 Examples:
   # Dry run mode
-  python script/airdrop.py --dry-run
+  python script/airdrop.py --dry-run --phases 2
 
+  # Test with first 3 recipients
+  python script/airdrop.py --phases 2 --limit 3
+  
   # Live execution (after testing with dry run)
-  python script/airdrop.py
+  python script/airdrop.py --phases 2
         """
     )
 
@@ -852,14 +926,42 @@ Examples:
     )
 
     parser.add_argument(
-        '--phase',
-        type=int,
+        '--phases',
+        type=str,
         required=True,
-        choices=[1, 2, 3, 4],
-        help='Airdrop phase to execute (1=5%% 1-day, 2=10%% 2-week, 3=10%% 2-month, 4=5%% 3-month)'
+        help='Airdrop phase(s) to execute as comma-separated values (e.g., "2" or "2,3"). Valid phases: 1=5%% 1-day, 2=10%% 2-week, 3=10%% 2-month, 4=5%% 3-month'
+    )
+    
+    parser.add_argument(
+        '--limit',
+        type=int,
+        help='Limit processing to first N recipients (useful for testing)'
     )
 
     return parser.parse_args()
+
+def parse_phases(phases_str: str) -> List[int]:
+    """Parse and validate phases parameter."""
+    try:
+        phases = [int(phase.strip()) for phase in phases_str.split(',')]
+
+        # Validate each phase
+        for phase in phases:
+            if phase not in [1, 2, 3, 4]:
+                raise ValueError(f"Invalid phase: {phase}. Must be 1, 2, 3, or 4")
+
+        # Remove duplicates and sort
+        phases = sorted(list(set(phases)))
+
+        if not phases:
+            raise ValueError("At least one valid phase must be specified")
+
+        return phases
+
+    except ValueError as e:
+        if "invalid literal for int()" in str(e):
+            raise ValueError(f"Invalid phase format: {phases_str}. Use comma-separated integers (e.g., '2,3')")
+        raise e
 
 def load_config_from_env(args=None) -> AirdropConfig:
     """Load configuration from environment variables and command line arguments."""
@@ -890,21 +992,26 @@ def load_config_from_env(args=None) -> AirdropConfig:
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         csv_file_path = os.path.join(base_dir, 'data', 'sol_nema_airdrop.csv')
 
+    # Parse phases from args
+    phases = parse_phases(args.phases) if args else [1]
+    phases_str = "_".join(map(str, phases))
+
     # Build configuration using environment variables
     config = AirdropConfig(
         rpc_url=os.getenv('SOLANA_RPC_URL', 'https://api.mainnet-beta.solana.com'),
         source_keypair=source_keypair,
         token_mint=token_mint,
         csv_file_path=csv_file_path,
-        phase=args.phase if args else 1,
+        phases=phases,
         dry_run=args.dry_run if args else False,
+        limit=args.limit if args and hasattr(args, 'limit') else None,
         batch_size=int(os.getenv('BATCH_SIZE', '10')),
         delay_between_batches=float(os.getenv('BATCH_DELAY', '1.0')),
         rpc_check_delay=float(os.getenv('RPC_CHECK_DELAY', '1.0')),
         rpc_check_batch=int(os.getenv('RPC_CHECK_BATCH', '3')),
         max_retries=int(os.getenv('MAX_RETRIES', '3')),
         log_level=os.getenv('LOG_LEVEL', 'INFO'),
-        progress_file=os.getenv('PROGRESS_FILE', f'airdrop_phase{args.phase if args else 1}_progress.json'),
+        progress_file=os.getenv('PROGRESS_FILE', f'airdrop_phases{phases_str}_progress.json'),
         token_decimals=int(os.getenv('TOKEN_DECIMALS', '6'))
     )
 
@@ -930,10 +1037,13 @@ def main():
 
         # Display configuration summary
         print("Configuration:")
-        print(f"  Phase: {config.phase}")
+        phases_str = ",".join(map(str, config.phases))
+        print(f"  Phases: {phases_str}")
         print(f"  RPC URL: {config.rpc_url}")
         print(f"  CSV File: {config.csv_file_path}")
         print(f"  Mode: {'DRY RUN' if config.dry_run else 'LIVE EXECUTION'}")
+        if config.limit:
+            print(f"  Limit: {config.limit} recipients")
         print(f"  Batch Size: {config.batch_size}")
         print(f"  Batch Delay: {config.delay_between_batches}s")
         print(f"  RPC Check Delay: {config.rpc_check_delay}s")
