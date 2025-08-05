@@ -17,7 +17,7 @@ from typing import List, Optional
 from dotenv import load_dotenv
 
 from solana.rpc.api import Client
-from solana.rpc.commitment import Confirmed
+from solana.rpc.commitment import Confirmed, Finalized, Processed
 from solana.rpc.types import TxOpts
 from solders.transaction import Transaction
 from solders.keypair import Keypair
@@ -128,6 +128,7 @@ class SolanaAirdropManager:
         # Disable noisy HTTP request logs
         logging.getLogger("httpx").setLevel(logging.WARNING)
         logging.getLogger("httpcore").setLevel(logging.WARNING)
+        logging.getLogger("solanaweb3.rpc.httprpc.HTTPClient").setLevel(logging.WARNING)
 
     def load_recipients(self) -> bool:
         """Load recipients from CSV file and validate data."""
@@ -155,7 +156,7 @@ class SolanaAirdropManager:
                 original_count = len(self.recipients)
                 self.recipients = self.recipients[:self.config.limit]
                 self.logger.info(f"Applied limit: Using first {len(self.recipients)} of {original_count} recipients")
-            
+
             self.logger.info(f"Loaded {len(self.recipients)} recipients")
             if self.blacklisted_wallets > 0:
                 self.logger.info(f"Skipped {self.blacklisted_wallets} blacklisted wallets")
@@ -357,8 +358,8 @@ class SolanaAirdropManager:
                     )
                     instructions.append(create_account_ix)
 
-                # Get fresh blockhash right before sending
-                recent_blockhash = self.rpc_client.get_latest_blockhash().value.blockhash
+                # Get fresh blockhash with confirmed commitment right before sending
+                recent_blockhash = self.rpc_client.get_latest_blockhash(commitment=Confirmed).value.blockhash
                 transaction = Transaction.new_signed_with_payer(
                     instructions,
                     self.config.source_keypair.pubkey(),
@@ -369,7 +370,7 @@ class SolanaAirdropManager:
                 # Send transaction
                 result = self.rpc_client.send_transaction(
                     transaction,
-                    opts=TxOpts(skip_confirmation=False, skip_preflight=False)
+                    opts=TxOpts(skip_confirmation=False, skip_preflight=False, preflight_commitment=Processed)
                 )
 
                 if result.value:
@@ -406,8 +407,8 @@ class SolanaAirdropManager:
                 mint=self.config.token_mint
             )
 
-            # Get fresh blockhash right before sending
-            recent_blockhash = self.rpc_client.get_latest_blockhash().value.blockhash
+            # Get fresh blockhash with confirmed commitment right before sending
+            recent_blockhash = self.rpc_client.get_latest_blockhash(commitment=Confirmed).value.blockhash
             transaction = Transaction.new_signed_with_payer(
                 [create_account_ix],
                 self.config.source_keypair.pubkey(),
@@ -504,8 +505,20 @@ class SolanaAirdropManager:
                 )
                 instructions.append(transfer_ix)
 
-            # Get fresh blockhash right before sending
-            recent_blockhash = self.rpc_client.get_latest_blockhash().value.blockhash
+            # Get fresh blockhash right before sending - try Processed first for latest data
+            try:
+                blockhash_response = self.rpc_client.get_latest_blockhash(commitment=Processed).value
+                recent_blockhash = blockhash_response.blockhash
+                self.logger.debug(f"Got blockhash for batch (Processed): {recent_blockhash} (slot: {blockhash_response.last_valid_block_height})")
+            except Exception as e:
+                self.logger.warning(f"Failed to get Processed blockhash, trying Finalized: {e}")
+                try:
+                    blockhash_response = self.rpc_client.get_latest_blockhash(commitment=Finalized).value
+                    recent_blockhash = blockhash_response.blockhash
+                    self.logger.info(f"Got blockhash for batch (Finalized): {recent_blockhash} (slot: {blockhash_response.last_valid_block_height})")
+                except Exception as e2:
+                    self.logger.error(f"Failed to get any blockhash: {e2}")
+                    return False
             transaction = Transaction.new_signed_with_payer(
                 instructions,
                 self.config.source_keypair.pubkey(),
@@ -521,9 +534,13 @@ class SolanaAirdropManager:
 
             if result.value:
                 total_tokens = sum(r.sol_nema_tokens for r in recipients)
-                self.logger.info(f"Batch transfer successful: {result.value} ({total_tokens:,.2f} tokens)")
+                self.logger.info(f"✅ Batch transfer successful: {len(recipients)} recipients, {total_tokens:,.2f} tokens")
+                self.logger.info(f"🔗 Transaction: https://solscan.io/tx/{result.value}")
+
+                # Log each successful transfer in the batch
                 for recipient in recipients:
                     recipient.status = "success"
+                    self.logger.info(f"   → {recipient.sol_wallet}: {recipient.sol_nema_tokens:,.2f} tokens")
                 return True
             else:
                 self.logger.error("Batch transfer failed")
@@ -568,21 +585,26 @@ class SolanaAirdropManager:
 
                 result = self.rpc_client.send_transaction(
                     transaction,
-                    opts=TxOpts(skip_confirmation=False, skip_preflight=False)
+                    opts=TxOpts(skip_confirmation=False, skip_preflight=False, preflight_commitment=Processed)
                 )
 
                 if result.value:
-                    self.logger.debug(f"Transfer successful to {recipient.sol_wallet}: {recipient.sol_nema_tokens:,.2f} tokens")
+                    self.logger.info(f"✅ Transfer successful: {recipient.sol_wallet} → {recipient.sol_nema_tokens:,.2f} tokens")
+                    self.logger.info(f"🔗 Transaction: https://solscan.io/tx/{result.value}")
                     return True
                 else:
                     self.logger.warning(f"Transfer failed to {recipient.sol_wallet} (attempt {attempt + 1})")
 
             except Exception as e:
-                self.logger.error(f"Error transferring to {recipient.sol_wallet} (attempt {attempt + 1}): {e}")
+                error_str = str(e).lower()
+                if "blockhash not found" in error_str:
+                    self.logger.warning(f"Blockhash not found error for {recipient.sol_wallet} (attempt {attempt + 1}), will retry with new blockhash")
+                else:
+                    self.logger.error(f"Error transferring to {recipient.sol_wallet} (attempt {attempt + 1}): {e}")
 
-            # Wait before retry
+            # Wait before retry - longer delay for blockhash issues
             if attempt < self.config.max_retries - 1:
-                time.sleep(1.0)
+                time.sleep(2.0)
 
         self.logger.error(f"Failed to transfer to {recipient.sol_wallet} after {self.config.max_retries} attempts")
         return False
@@ -733,7 +755,7 @@ class SolanaAirdropManager:
             batch = pending_recipients[i:i + batch_size]
             batch_num = i // batch_size + 1
 
-            self.logger.info(f"Processing batch {batch_num}/{total_batches} ({len(batch)} recipients)")
+            self.logger.info(f"📦 Processing batch {batch_num}/{total_batches} ({len(batch)} recipients)")
 
             if self._execute_transfer_batch(batch, source_token_account):
                 self.successful_transfers += len(batch)
@@ -913,7 +935,7 @@ Examples:
 
   # Test with first 3 recipients
   python script/airdrop.py --phases 2 --limit 3
-  
+
   # Live execution (after testing with dry run)
   python script/airdrop.py --phases 2
         """
@@ -931,7 +953,7 @@ Examples:
         required=True,
         help='Airdrop phase(s) to execute as comma-separated values (e.g., "2" or "2,3"). Valid phases: 1=5%% 1-day, 2=10%% 2-week, 3=10%% 2-month, 4=5%% 3-month'
     )
-    
+
     parser.add_argument(
         '--limit',
         type=int,
